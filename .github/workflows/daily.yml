@@ -26,5 +26,6 @@ jobs:
           CHAT_ID: ${{ secrets.CHAT_ID }}
           MAX_ITEMS: "10"
           DAYS_LOOKBACK: "2"
+          LIBRETRANSLATE_URL: "https://libretranslate.de/translate"
         run: |
           python bot.py
