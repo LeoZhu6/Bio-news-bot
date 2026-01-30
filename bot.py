@@ -7,6 +7,7 @@ from urllib.parse import quote_plus
 import requests
 import feedparser
 from bs4 import BeautifulSoup
+import trafilatura
 
 
 COMPANIES = [
@@ -38,10 +39,12 @@ EXTRA_KEYWORDS_DEFAULT = ["FDA", "EMA", "NMPA", "clinical trial", "Phase 3", "ac
 MAX_ITEMS = int(os.getenv("MAX_ITEMS", "10"))
 DAYS_LOOKBACK = int(os.getenv("DAYS_LOOKBACK", "2"))
 
+# Free translation via LibreTranslate public instance (no signup)
+# Note: public instances may rate-limit; we implement fallback.
+LIBRETRANSLATE_URL = os.getenv("LIBRETRANSLATE_URL", "https://libretranslate.de/translate")
+
 
 def google_news_rss_url(query: str) -> str:
-    # Google News RSS
-    # hl/gl/ceid 这里用 US 英文聚合，覆盖国际媒体；中文公司名也能搜到
     q = quote_plus(query)
     return f"https://news.google.com/rss/search?q={q}&hl=en-US&gl=US&ceid=US:en"
 
@@ -87,39 +90,70 @@ def esc(x: str) -> str:
     return html.escape(x or "")
 
 
-def format_digest(items):
-    lines = []
-    lines.append("<b>🧬 医药大厂新闻速递（国内外）</b>")
-    lines.append(f"<i>{esc(datetime.now().strftime('%Y-%m-%d %H:%M'))}</i>")
-    lines.append("")
-    for i, it in enumerate(items, 1):
-        title = esc((it.get("title") or "")[:200])
-        link = it.get("link") or ""
-        company = esc(it.get("company") or "")
-        source = esc(it.get("source") or "")
-        summary = esc((it.get("summary") or "")[:260])
+def libre_translate(text: str, source: str = "en", target: str = "zh") -> str:
+    text = (text or "").strip()
+    if not text:
+        return ""
+    try:
+        r = requests.post(
+            LIBRETRANSLATE_URL,
+            timeout=20,
+            data={
+                "q": text,
+                "source": source,
+                "target": target,
+                "format": "text",
+            },
+            headers={"User-Agent": "Mozilla/5.0"},
+        )
+        r.raise_for_status()
+        data = r.json()
+        out = (data.get("translatedText") or "").strip()
+        return out or text
+    except Exception:
+        # Fallback: return original text if translation fails
+        return text
 
-        headline = f'🔹 <a href="{esc(link)}">{title}</a>' if link else f"🔹 {title}"
-        meta = " · ".join([x for x in [company, source] if x])
-        if meta:
-            meta = f"<i>{meta}</i>"
 
-        lines.append(f"{i}. {headline}")
-        if meta:
-            lines.append(meta)
-        if summary:
-            lines.append(summary)
-        lines.append("")
-    lines.append("—")
-    lines.append("<i>来源：Google News RSS 聚合；配图为网页 OG 图（可能因站点限制缺失）。</i>")
-    return "\n".join(lines).strip()
+def fetch_article_text(url: str) -> str:
+    """Try to extract main text. Might fail for paywalls/anti-bot pages."""
+    try:
+        downloaded = trafilatura.fetch_url(url)
+        if not downloaded:
+            return ""
+        extracted = trafilatura.extract(downloaded, include_comments=False, include_tables=False)
+        return (extracted or "").strip()
+    except Exception:
+        return ""
+
+
+def naive_bullets(text: str, max_bullets: int = 3) -> list[str]:
+    """Simple heuristic summary: take first sentences/clauses."""
+    t = re.sub(r"\s+", " ", (text or "").strip())
+    if not t:
+        return []
+
+    # Split by sentence-ish punctuation
+    parts = re.split(r"(?<=[\.\!\?。！？])\s+", t)
+    bullets = []
+    for p in parts:
+        p = p.strip()
+        if len(p) < 30:
+            continue
+        bullets.append(p)
+        if len(bullets) >= max_bullets:
+            break
+
+    if not bullets:
+        bullets = [t[:220]]
+    return [b[:260] for b in bullets]
 
 
 def tg_send_message(token: str, chat_id: str, text: str):
     url = f"https://api.telegram.org/bot{token}/sendMessage"
     r = requests.post(
         url,
-        timeout=15,
+        timeout=20,
         data={
             "chat_id": chat_id,
             "text": text,
@@ -134,15 +168,12 @@ def tg_send_photo(token: str, chat_id: str, photo_url: str, caption: str):
     url = f"https://api.telegram.org/bot{token}/sendPhoto"
     r = requests.post(
         url,
-        timeout=20,
+        timeout=25,
         data={"chat_id": chat_id, "caption": caption, "parse_mode": "HTML"},
-        files=None,
         params={"photo": photo_url},
     )
-    # 有些 host 会拒绝 Telegram 拉图，失败就忽略
     if r.status_code >= 400:
         return
-    return
 
 
 def fetch_news():
@@ -174,7 +205,7 @@ def fetch_news():
             if e.get("source") and isinstance(e["source"], dict):
                 source = (e["source"].get("title") or "").strip()
 
-            summary = clean_html_to_text(e.get("summary", "") or e.get("description", "") or "")
+            rss_summary = clean_html_to_text(e.get("summary", "") or e.get("description", "") or "")
 
             all_items.append(
                 {
@@ -183,13 +214,57 @@ def fetch_news():
                     "link": link,
                     "source": source,
                     "published": published.isoformat() if published else "",
-                    "summary": summary,
+                    "rss_summary": rss_summary,
                 }
             )
             seen_links.add(link)
 
     all_items.sort(key=lambda x: x.get("published") or "", reverse=True)
     return all_items[:MAX_ITEMS]
+
+
+def build_cn_digest(items: list[dict]) -> tuple[str, list[dict]]:
+    lines = []
+    lines.append("<b>🧬 医药大厂新闻速递（中文要点）</b>")
+    lines.append(f"<i>{esc(datetime.now().strftime('%Y-%m-%d %H:%M'))}</i>")
+    lines.append("")
+
+    enriched = []
+
+    for idx, it in enumerate(items, 1):
+        # Extract article text (best-effort)
+        article_text = fetch_article_text(it["link"])
+        base_text = article_text if len(article_text) >= 200 else (it.get("rss_summary") or it["title"])
+
+        bullets_en = naive_bullets(base_text, max_bullets=3)
+
+        title_cn = libre_translate(it["title"], source="en", target="zh")
+        bullets_cn = [libre_translate(b, source="en", target="zh") for b in bullets_en]
+
+        company = it.get("company", "")
+        source = it.get("source", "")
+
+        lines.append(f"{idx}. <b>{esc(title_cn[:120])}</b>")
+        lines.append(f"<i>{esc(company)} · {esc(source)}</i>")
+        for b in bullets_cn:
+            b = (b or "").strip()
+            if b:
+                lines.append(f"• {esc(b)}")
+        lines.append("")
+
+        enriched.append(
+            {
+                "title_cn": title_cn,
+                "bullets_cn": bullets_cn,
+                "company": company,
+                "source": source,
+                "link": it["link"],
+            }
+        )
+
+    lines.append("—")
+    lines.append("<i>说明：为合规与稳定性，推送为“中文摘要/要点复述”，不直接转发原文全文。</i>")
+    return "\n".join(lines).strip(), enriched
 
 
 def main():
@@ -203,14 +278,16 @@ def main():
         tg_send_message(token, chat_id, "<b>🧬 医药新闻</b>\n\n今天未抓到要闻。")
         return
 
-    tg_send_message(token, chat_id, format_digest(items))
+    digest, enriched = build_cn_digest(items)
+    tg_send_message(token, chat_id, digest)
 
-    # 尝试给前 3 条补图
-    for it in items[:3]:
+    # Try images for top 3
+    for it in enriched[:3]:
         img = try_get_og_image(it["link"])
         if not img:
             continue
-        caption = f'🖼️ <a href="{esc(it["link"])}">{esc(it["title"][:180])}</a>'
+        # no link in caption; just text
+        caption = f"🖼️ {it['title_cn'][:180]}"
         tg_send_photo(token, chat_id, img, caption)
 
 
